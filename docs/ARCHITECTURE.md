@@ -74,6 +74,71 @@ gzip 后的大小会有波动，90MB 留了安全余量且减少切片数。
 
 **通用原则**：日志里出现「看起来太大/太小的数字」（4.0K 对于一个有几百会话的库）时，**必须停下来追究**。那个数字就是警报。
 
+### 坑 1.5：管道吞掉退出码 —— 同一个「假成功」换了个马甲
+
+这个坑在写这份文档的**当天**又犯了一次，所以单独记下来。
+
+恢复演练脚本里我写了这么一行：
+
+```bash
+if git clone -q "$URL" vault 2>&1 | tail -3; then
+    echo "✅ 克隆完成"
+fi
+```
+
+克隆其实**失败了**（网络中断：`fetch-pack: unexpected disconnect while reading sideband packet`），
+但日志照样打印：
+
+```
+fatal: 过早的文件结束符（EOF）
+✅ 克隆完成，耗时 1242 秒          ← 撒谎
+cd: vault: 没有那个文件或目录
+```
+
+原因：**`if cmd | tail` 判断的是管道最后一段（`tail`）的退出码**，而 `tail` 永远返回 0。
+第一段的失败被完全吞掉。
+
+这跟坑 1 是**同一个病**：把「命令跑了 / 有输出」当成「成功了」。
+
+```bash
+# ✗ 错：判断的是 tail 的退出码（永远 0）
+if git clone "$URL" vault 2>&1 | tail -3; then ...
+
+# ✓ 正确写法一：直接判 git 的退出码，输出单独看
+if git clone "$URL" vault >/tmp/clone.log 2>&1; then
+    tail -3 /tmp/clone.log
+else
+    tail -20 /tmp/clone.log; exit 1
+fi
+
+# ✓ 正确写法二：开 pipefail，管道任一段失败都算失败
+set -o pipefail
+```
+
+**通用规则**：任何 `cmd | grep`、`cmd | tail`、`cmd | head` 后面接 `if` / `&&`，
+都要停下来想一秒"我在判断谁的退出码"。日志里的 ✓ 很容易骗人，退出码不会。
+
+### 坑 1.6：国内网络拉大仓库 —— 用 fetch 循环断点续传
+
+单次 `git clone` 在国内拉几百 MB 大概率中途断（实测 143MB 传了 20 分钟断掉）。
+改成 `git init` + `git fetch` 循环重试：`fetch` 会复用已下载的对象，每次重试接着传，
+不重新开始。
+
+```bash
+git init -q vault && cd vault
+git remote add origin "$URL"
+git config http.postBuffer 524288000   # 大对象缓冲，防推送中断
+git config http.lowSpeedLimit 1000
+git config http.lowSpeedTime 60        # 低速超时，避免连接假死
+for i in $(seq 1 8); do
+    git fetch --depth 1 origin main && break
+    sleep 10
+done
+git checkout -q main 2>/dev/null || git checkout -q -b main FETCH_HEAD
+```
+
+配合 `--depth 1`（只拉最新提交，恢复场景不需要历史），体积能再降一截。
+
 ### 坑 2：schema 跨版本漂移
 
 老版 Hermes：`sessions` 表有 `last_activity_at`

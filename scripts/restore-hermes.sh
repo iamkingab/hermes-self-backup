@@ -34,11 +34,32 @@ fi
 NEED_PASS=0
 [ -s "$GPG_PASS_FILE" ] || NEED_PASS=1
 
-# ───────── 2. 克隆 ─────────
+# ───────── 2. 克隆（带重试 + 断点续传）─────────
+# 注意：不要写 `git clone ... | tail -3` 再判退出码 —— 管道返回的是 tail 的退出码
+# （永远 0），git 失败会被当成成功。这是本项目踩过的最隐蔽的坑之一。
 info "从 GitHub 克隆备份"
 rm -rf "$WORK"; mkdir -p "$WORK"
-git clone -q "$REPO_URL" "$WORK/vault" || die "克隆失败（检查地址与 token）"
-cd "$WORK/vault"
+cd "$WORK"
+git init -q vault && cd vault
+git remote add origin "$REPO_URL"
+git config http.postBuffer 524288000
+git config http.lowSpeedLimit 1000
+git config http.lowSpeedTime 60
+
+CLONE_OK=0
+for attempt in $(seq 1 "${CLONE_RETRIES:-5}"); do
+    info "拉取尝试 $attempt/${CLONE_RETRIES:-5} ..."
+    t0=$(date +%s)
+    if git fetch --depth 1 origin main && git rev-parse FETCH_HEAD >/dev/null 2>&1; then
+        info "拉取成功（$(( $(date +%s) - t0 )) 秒）"
+        CLONE_OK=1
+        break
+    fi
+    warn "本次拉取失败（$(( $(date +%s) - t0 )) 秒）—— 网络中断时断点续传会自动接着传"
+    sleep "${CLONE_RETRY_SLEEP:-8}"
+done
+[ "$CLONE_OK" -eq 1 ] || die "多次尝试后仍无法从 GitHub 拉取备份（检查网络/代理/token）"
+git checkout -q main 2>/dev/null || git checkout -q -b main FETCH_HEAD
 ok "克隆完成: $(git rev-parse --short HEAD) / $(du -sh . | cut -f1)"
 
 # ───────── 3. 停 Hermes ─────────
